@@ -24,9 +24,11 @@ from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
 from urllib.parse import parse_qs, quote
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse, Response
 
+load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent
 SITES_DIR = (BASE_DIR / os.getenv("SITE_GUARD_SITES_DIR", "sites")).resolve()
