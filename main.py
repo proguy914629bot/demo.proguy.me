@@ -38,6 +38,7 @@ PASSWORD_HASH = os.getenv("SITE_GUARD_PASSWORD_HASH", "")
 SESSION_TTL = int(os.getenv("SITE_GUARD_SESSION_TTL", "28800"))
 MAX_TEXT_BYTES = int(os.getenv("SITE_GUARD_MAX_TEXT_BYTES", str(5 * 1024 * 1024)))
 COOKIE_SECURE = os.getenv("SITE_GUARD_COOKIE_SECURE", "0").lower() in {"1", "true", "yes"}
+BLOCK_MOBILE_DEVICES = os.getenv("SITE_GUARD_BLOCK_MOBILE", "1").lower() in {"1", "true", "yes"}
 AGGRESSIVE_PROTECTION = os.getenv("SITE_GUARD_AGGRESSIVE", "0").lower() in {"1", "true", "yes"}
 DEVTOOLS_THRESHOLD = int(os.getenv("SITE_GUARD_DEVTOOLS_THRESHOLD", "170"))
 SECRET = os.getenv("SITE_GUARD_SECRET", "").encode() or secrets.token_bytes(32)
@@ -64,6 +65,10 @@ SAFE_ASSET_SUFFIXES = {
     ".mp4", ".ogg", ".otf", ".pdf", ".png", ".svg", ".ttf", ".txt", ".wasm",
     ".wav", ".webm", ".webmanifest", ".webp", ".woff", ".woff2", ".xml",
 }
+MOBILE_USER_AGENT_RE = re.compile(
+    r"Android|iPhone|iPad|iPod|Windows Phone|Mobile Safari|Opera Mini|IEMobile|Kindle|Silk/|webOS|BlackBerry",
+    re.IGNORECASE,
+)
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -167,6 +172,15 @@ def _credential_version(site: str) -> str:
 def _browser_binding(request: Request) -> str:
     user_agent = request.headers.get("user-agent", "").encode("utf-8", errors="replace")
     return _b64url(hmac.new(SECRET, b"browser\0" + user_agent, hashlib.sha256).digest()[:12])
+
+
+def _mobile_device_request(request: Request) -> bool:
+    return BLOCK_MOBILE_DEVICES and bool(MOBILE_USER_AGENT_RE.search(request.headers.get("user-agent", "")))
+
+
+def _mobile_blocked_page() -> HTMLResponse:
+    document = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="robots" content="noindex,nofollow"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Unsupported device</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#09090b;color:#fafafa;font:16px system-ui}main{max-width:34rem;padding:2rem;text-align:center}p{color:#a1a1aa}</style></head><body><main><h1>Unsupported device</h1><p>This site is available on desktop browsers only.</p></main><script>const u=navigator.userAgent;const touchMac=/Macintosh|Mac OS X/i.test(u)&&navigator.maxTouchPoints>1;const mobile=/Android|iPhone|iPad|iPod|Windows Phone|Mobile Safari|Opera Mini|IEMobile|Kindle|Silk\\/|webOS|BlackBerry/i.test(u)||touchMac;if(!mobile)location.replace('/');</script></body></html>"""
+    return HTMLResponse(document, status_code=403, headers=_security_headers())
 
 
 def _issue_token(site: str, request: Request) -> str:
@@ -305,9 +319,10 @@ def _runtime_script(marker: str) -> str:
     # authorization boundary; the server-side session remains the real boundary.
     aggressive = "true" if AGGRESSIVE_PROTECTION else "false"
     return f"""(()=>{{
-const firefoxLike=/Firefox|Zen/i.test(navigator.userAgent),threshold=Math.max({DEVTOOLS_THRESHOLD},170),widthThreshold=firefoxLike?Math.max(threshold,330):Math.max(threshold,320),aggressive={aggressive},marker='{marker}',safeLog=console.log.bind(console),safeClear=console.clear.bind(console);let blocked=false,getterHits=0,getterSignals=0;
+const mobileDevice=/Android|iPhone|iPad|iPod|Windows Phone|Mobile Safari|Opera Mini|IEMobile|Kindle|Silk\\/|webOS|BlackBerry/i.test(navigator.userAgent)||(/Macintosh|Mac OS X/i.test(navigator.userAgent)&&navigator.maxTouchPoints>1),firefoxLike=/Firefox|Zen/i.test(navigator.userAgent),threshold=Math.max({DEVTOOLS_THRESHOLD},170),widthThreshold=firefoxLike?Math.max(threshold,330):Math.max(threshold,320),aggressive={aggressive},marker='{marker}',safeLog=console.log.bind(console),safeClear=console.clear.bind(console);let blocked=false,getterHits=0,getterSignals=0;
 document.documentElement.style.visibility='hidden';
 const deny=()=>{{if(blocked)return;blocked=true;document.documentElement.style.visibility='visible';document.documentElement.innerHTML='<head><title>Inspection blocked</title></head><body style="margin:0;background:#09090b;color:#fafafa;font:16px system-ui;display:grid;place-items:center;min-height:100vh"><main style="text-align:center"><h1>Inspection blocked</h1><p>Close developer tools and reload this page.</p></main></body>';if(aggressive){{let n=0;const trap=setInterval(()=>{{debugger;if(++n>80)clearInterval(trap)}},125);}}}};
+if(mobileDevice)deny();
 const dimensions=()=>{{const widthGap=window.outerWidth-window.innerWidth,heightGap=window.outerHeight-window.innerHeight,open=widthGap>widthThreshold||heightGap>threshold;if(open)deny();return open;}};
 const pauseStart=performance.now();if(!firefoxLike)debugger;const debuggerOpen=!firefoxLike&&performance.now()-pauseStart>100;if(debuggerOpen)deny();
 const probe=new Image();Object.defineProperty(probe,'id',{{configurable:false,get(){{getterHits++;return'guard';}}}});
@@ -317,7 +332,7 @@ document.addEventListener('contextmenu',event=>event.preventDefault());
 document.addEventListener('keydown',event=>{{const key=event.key.toLowerCase();if(key==='f12'||(event.ctrlKey&&event.shiftKey&&['i','j','c'].includes(key))||(event.ctrlKey&&key==='u')){{event.preventDefault();deny();}}}},true);
 window.addEventListener('beforeprint',deny);
 new MutationObserver(()=>{{if(!document.querySelector('meta[data-site-guard="'+marker+'"]'))deny();}}).observe(document.documentElement,{{childList:true,subtree:true}});
-if(!dimensions()&&!debuggerOpen)document.documentElement.style.visibility='visible';
+if(!blocked&&!dimensions()&&!debuggerOpen)document.documentElement.style.visibility='visible';
 }})();"""
 
 
@@ -433,10 +448,11 @@ def _protect_html(source: str, site: str, route_prefix: str | None = None) -> st
         "<title>Loading…</title><style>html{visibility:hidden}</style></head><body>"
         "<noscript>JavaScript is required.</noscript><script>"
         "const blockedMarkup='" + blocked_markup.replace("'", "\\'") + "';"
+        "const mobileDevice=/Android|iPhone|iPad|iPod|Windows Phone|Mobile Safari|Opera Mini|IEMobile|Kindle|Silk\\/|webOS|BlackBerry/i.test(navigator.userAgent)||(/Macintosh|Mac OS X/i.test(navigator.userAgent)&&navigator.maxTouchPoints>1);"
         "const firefoxLike=/Firefox|Zen/i.test(navigator.userAgent);const pauseStart=performance.now();if(!firefoxLike)debugger;const debuggerOpen=!firefoxLike&&performance.now()-pauseStart>100;"
         "const threshold=Math.max(" + str(DEVTOOLS_THRESHOLD) + ",170);const widthThreshold=firefoxLike?Math.max(threshold,330):Math.max(threshold,320);"
         "const devtoolsOpen=(window.outerWidth-window.innerWidth)>widthThreshold||(window.outerHeight-window.innerHeight)>threshold;"
-        "if(devtoolsOpen||debuggerOpen){document.documentElement.style.visibility='visible';document.documentElement.innerHTML=blockedMarkup;}"
+        "if(mobileDevice||devtoolsOpen||debuggerOpen){document.documentElement.style.visibility='visible';document.documentElement.innerHTML=blockedMarkup;}"
         "else{const d=" + decoder + ";document.open();document.write(d);document.close();}"
         "</script></body></html>"
     )
@@ -556,6 +572,8 @@ async def root() -> PlainTextResponse:
 
 @app.post("/__guard/login")
 async def login(request: Request) -> Response:
+    if _mobile_device_request(request):
+        return _mobile_blocked_page()
     content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
     if content_type != "application/x-www-form-urlencoded":
         return PlainTextResponse("Unsupported content type", status_code=415)
@@ -670,6 +688,8 @@ async def guarded_site(request: Request, site: str, resource_path: str = "") -> 
     if context is None:
         return PlainTextResponse("Site not found", status_code=404)
     site, resource_path, site_dir, route_prefix = context
+    if _mobile_device_request(request):
+        return _mobile_blocked_page()
 
     requested_path = request.url.path
     if request.url.query:
