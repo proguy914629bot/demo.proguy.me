@@ -78,6 +78,7 @@ For production, terminate HTTPS at a reverse proxy, set `SITE_GUARD_COOKIE_SECUR
 - Encodes classic JavaScript inside an execution wrapper; ES modules stay unobfuscated so their import/export semantics are not broken.
 - Conservatively compacts CSS while leaving the source files on disk untouched.
 - Detects common DevTools window-size changes, repeated object-getter probes, and inspection shortcuts; wipes the document on detection; clears the console every 100 ms; and optionally enables a bounded debugger trap.
+- Uses browser-compatible width/height thresholds so vertical-tab sidebars do not look like docked DevTools; Firefox/Zen also skip the two browser-specific probes that otherwise produce false positives there.
 - Watches its injected guard marker for DOM tampering and blocks printing while the guarded page is active.
 - Sends no-cache, no-index, anti-framing, object-blocking, same-origin resource, and optional HSTS headers.
 - Refuses oversized HTML, CSS, and JavaScript transformation requests; configure the limit with `SITE_GUARD_MAX_TEXT_BYTES`.

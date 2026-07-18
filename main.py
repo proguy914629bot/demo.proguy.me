@@ -305,13 +305,13 @@ def _runtime_script(marker: str) -> str:
     # authorization boundary; the server-side session remains the real boundary.
     aggressive = "true" if AGGRESSIVE_PROTECTION else "false"
     return f"""(()=>{{
-const threshold={DEVTOOLS_THRESHOLD},aggressive={aggressive},marker='{marker}',safeLog=console.log.bind(console),safeClear=console.clear.bind(console);let blocked=false,getterHits=0,getterSignals=0;
+const firefoxLike=/Firefox|Zen/i.test(navigator.userAgent),threshold=Math.max({DEVTOOLS_THRESHOLD},170),widthThreshold=firefoxLike?Math.max(threshold,330):Math.max(threshold,320),aggressive={aggressive},marker='{marker}',safeLog=console.log.bind(console),safeClear=console.clear.bind(console);let blocked=false,getterHits=0,getterSignals=0;
 document.documentElement.style.visibility='hidden';
 const deny=()=>{{if(blocked)return;blocked=true;document.documentElement.style.visibility='visible';document.documentElement.innerHTML='<head><title>Inspection blocked</title></head><body style="margin:0;background:#09090b;color:#fafafa;font:16px system-ui;display:grid;place-items:center;min-height:100vh"><main style="text-align:center"><h1>Inspection blocked</h1><p>Close developer tools and reload this page.</p></main></body>';if(aggressive){{let n=0;const trap=setInterval(()=>{{debugger;if(++n>80)clearInterval(trap)}},125);}}}};
-const dimensions=()=>{{const open=Math.max(window.outerWidth-window.innerWidth,window.outerHeight-window.innerHeight)>threshold;if(open)deny();return open;}};
-const pauseStart=performance.now();debugger;const debuggerOpen=performance.now()-pauseStart>100;if(debuggerOpen)deny();
+const dimensions=()=>{{const widthGap=window.outerWidth-window.innerWidth,heightGap=window.outerHeight-window.innerHeight,open=widthGap>widthThreshold||heightGap>threshold;if(open)deny();return open;}};
+const pauseStart=performance.now();if(!firefoxLike)debugger;const debuggerOpen=!firefoxLike&&performance.now()-pauseStart>100;if(debuggerOpen)deny();
 const probe=new Image();Object.defineProperty(probe,'id',{{configurable:false,get(){{getterHits++;return'guard';}}}});
-setInterval(()=>{{dimensions();const before=getterHits;safeLog(probe);setTimeout(()=>{{getterSignals=getterHits>before?getterSignals+1:0;if(getterSignals>=3)deny();}},0);safeClear();}},100);
+setInterval(()=>{{dimensions();if(!firefoxLike){{const before=getterHits;safeLog(probe);setTimeout(()=>{{getterSignals=getterHits>before?getterSignals+1:0;if(getterSignals>=3)deny();}},0);}}safeClear();}},100);
 window.addEventListener('resize',dimensions,{{passive:true}});dimensions();
 document.addEventListener('contextmenu',event=>event.preventDefault());
 document.addEventListener('keydown',event=>{{const key=event.key.toLowerCase();if(key==='f12'||(event.ctrlKey&&event.shiftKey&&['i','j','c'].includes(key))||(event.ctrlKey&&key==='u')){{event.preventDefault();deny();}}}},true);
@@ -433,8 +433,9 @@ def _protect_html(source: str, site: str, route_prefix: str | None = None) -> st
         "<title>Loading…</title><style>html{visibility:hidden}</style></head><body>"
         "<noscript>JavaScript is required.</noscript><script>"
         "const blockedMarkup='" + blocked_markup.replace("'", "\\'") + "';"
-        "const pauseStart=performance.now();debugger;const debuggerOpen=performance.now()-pauseStart>100;"
-        "const devtoolsOpen=Math.max(window.outerWidth-window.innerWidth,window.outerHeight-window.innerHeight)>" + str(DEVTOOLS_THRESHOLD) + ";"
+        "const firefoxLike=/Firefox|Zen/i.test(navigator.userAgent);const pauseStart=performance.now();if(!firefoxLike)debugger;const debuggerOpen=!firefoxLike&&performance.now()-pauseStart>100;"
+        "const threshold=Math.max(" + str(DEVTOOLS_THRESHOLD) + ",170);const widthThreshold=firefoxLike?Math.max(threshold,330):Math.max(threshold,320);"
+        "const devtoolsOpen=(window.outerWidth-window.innerWidth)>widthThreshold||(window.outerHeight-window.innerHeight)>threshold;"
         "if(devtoolsOpen||debuggerOpen){document.documentElement.style.visibility='visible';document.documentElement.innerHTML=blockedMarkup;}"
         "else{const d=" + decoder + ";document.open();document.write(d);document.close();}"
         "</script></body></html>"
