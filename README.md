@@ -25,6 +25,20 @@ uvicorn main:app --host 127.0.0.1 --port 8000
 
 Then open <http://127.0.0.1:8000/example.com>. The development defaults are `admin` / `change-me`; do not use those defaults on a public deployment. `SITE_GUARD_PASSWORD` remains supported for local development, but the PBKDF2 hash is preferred.
 
+## Run with systemd
+
+The repository includes [demo-proguy-me.service](demo-proguy-me.service). On the Linux host, update its `User`, `WorkingDirectory`, and `ExecStart` paths if needed, then install and enable it:
+
+```bash
+sudo install -d -m 0750 /etc/demo.proguy.me
+sudo install -m 0644 demo-proguy-me.service /etc/systemd/system/demo-proguy-me.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now demo-proguy-me.service
+sudo systemctl status demo-proguy-me.service
+```
+
+Put production secrets in `/etc/demo.proguy.me/site-guard.env` (for example `SITE_GUARD_SECRET`, `SITE_GUARD_USERNAME`, and `SITE_GUARD_PASSWORD_HASH`) and restrict it with `sudo chmod 0600 /etc/demo.proguy.me/site-guard.env`.
+
 Each site can have its own credentials in `sites/<site-name>/.guard.json`. The file is read only by the server, is blocked from URL serving, and is ignored by Git:
 
 ```json

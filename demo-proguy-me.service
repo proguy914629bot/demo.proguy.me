@@ -1,0 +1,23 @@
+[Unit]
+Description=FastAPI site guard for demo.proguy.me
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/var/www/demo.proguy.me
+EnvironmentFile=-/etc/demo.proguy.me/site-guard.env
+ExecStart=/var/www/demo.proguy.me/.venv/bin/uvicorn main:app --host 127.0.0.1 --port 8881
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/www/demo.proguy.me
+
+[Install]
+WantedBy=multi-user.target
