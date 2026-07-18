@@ -117,6 +117,36 @@ def _csrf_cookie_name(site: str) -> str:
     return "site_guard_csrf_" + hashlib.sha256(site.encode()).hexdigest()[:12]
 
 
+def _issue_context_token(site: str, route_prefix: str) -> str:
+    payload = json.dumps(
+        {"site": site, "route": route_prefix, "exp": int(time.time()) + 900},
+        separators=(",", ":"),
+    ).encode()
+    encoded = _b64url(payload)
+    signature = _b64url(hmac.new(SECRET, b"context\0" + encoded.encode(), hashlib.sha256).digest())
+    return f"{encoded}.{signature}"
+
+
+def _valid_context_token(token: str | None) -> tuple[str, str] | None:
+    if not token:
+        return None
+    try:
+        encoded, supplied_signature = token.split(".", 1)
+        expected_signature = _b64url(hmac.new(SECRET, b"context\0" + encoded.encode(), hashlib.sha256).digest())
+        if not hmac.compare_digest(supplied_signature, expected_signature):
+            return None
+        payload = json.loads(_b64url_decode(encoded))
+        if not isinstance(payload, dict) or int(payload.get("exp", 0)) < int(time.time()):
+            return None
+        site = str(payload.get("site", ""))
+        route_prefix = str(payload.get("route", ""))
+        if _site_directory(site) is None or not route_prefix.endswith("/" + site):
+            return None
+        return site, route_prefix
+    except (ValueError, TypeError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+
+
 def _site_credentials_file(site: str) -> Path | None:
     site_dir = _site_directory(site)
     if site_dir is None:
@@ -686,6 +716,12 @@ def _site_route_context(site_segment: str, resource_path: str) -> tuple[str, str
 async def guarded_site(request: Request, site: str, resource_path: str = "") -> Response:
     context = _site_route_context(site, resource_path)
     if context is None:
+        legacy_context = _valid_context_token(request.cookies.get("site_guard_context"))
+        if legacy_context:
+            _, route_prefix = legacy_context
+            requested_asset = request.url.path.lstrip("/")
+            if requested_asset and not requested_asset.startswith("__guard/"):
+                return RedirectResponse(f"{route_prefix}/{requested_asset}", status_code=307)
         return PlainTextResponse("Site not found", status_code=404)
     site, resource_path, site_dir, route_prefix = context
     if _mobile_device_request(request):
@@ -709,10 +745,22 @@ async def guarded_site(request: Request, site: str, resource_path: str = "") -> 
             source = resource.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             return PlainTextResponse("HTML must be UTF-8", status_code=500)
-        return HTMLResponse(
+        response = HTMLResponse(
             _protect_html(source, site, route_prefix),
             headers=_security_headers("text/html; charset=utf-8"),
         )
+        # This is only a routing hint for legacy root-relative asset requests;
+        # the per-site authentication cookie remains the authorization boundary.
+        response.set_cookie(
+            "site_guard_context",
+            _issue_context_token(site, route_prefix),
+            max_age=900,
+            path="/",
+            secure=COOKIE_SECURE,
+            httponly=True,
+            samesite="strict",
+        )
+        return response
     if suffix == ".css":
         if resource.stat().st_size > MAX_TEXT_BYTES:
             return PlainTextResponse("CSS file is too large", status_code=413)

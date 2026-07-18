@@ -74,6 +74,7 @@ For production, terminate HTTPS at a reverse proxy, set `SITE_GUARD_COOKIE_SECUR
 - Prefixes root-relative `href`, `src`, `action`, and `poster` attributes with the current site name. Explicit external, protocol-relative, fragment, and ordinary relative URLs are preserved.
 - Converts bare domain-shaped paths such as `example.com/abc` into guarded paths such as `/example/example.com/abc`. Explicit `https://...` and `//...` URLs remain external.
 - Also supports deployments mounted below a URL prefix, such as `/example/example.com/...`; generated asset links and cookie paths retain that prefix.
+- Adds a short-lived signed routing hint so legacy root-relative requests such as `/css/styles.css` are redirected to the currently guarded site instead of returning a confusing 404.
 - Encodes each HTML response with a new random XOR key and injects it through a generated JavaScript loader.
 - Encodes classic JavaScript inside an execution wrapper; ES modules stay unobfuscated so their import/export semantics are not broken.
 - Conservatively compacts CSS while leaving the source files on disk untouched.
