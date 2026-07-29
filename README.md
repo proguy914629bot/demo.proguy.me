@@ -72,15 +72,16 @@ For production, terminate HTTPS at a reverse proxy, set `SITE_GUARD_COOKIE_SECUR
 - Protects login forms with short-lived, HTTP-only, same-site CSRF cookies and validates redirect destinations strictly.
 - Rejects traversal, symlink escapes, dotfiles, source maps, and unapproved asset types.
 - Prefixes root-relative `href`, `src`, `action`, and `poster` attributes with the current site name. Explicit external, protocol-relative, fragment, and ordinary relative URLs are preserved.
+- Prefixes root-relative CSS `url(...)` values with the current site route, so `/assets/font.ttf` is served from `/<site>/assets/font.ttf`.
 - Converts bare domain-shaped paths such as `example.com/abc` into guarded paths such as `/example/example.com/abc`. Explicit `https://...` and `//...` URLs remain external.
 - Also supports deployments mounted below a URL prefix, such as `/example/example.com/...`; generated asset links and cookie paths retain that prefix.
 - Adds a short-lived signed routing hint so legacy root-relative requests such as `/css/styles.css` are redirected to the currently guarded site instead of returning a confusing 404.
 - Encodes each HTML response with a new random XOR key and injects it through a generated JavaScript loader.
-- Encodes classic JavaScript inside an execution wrapper; ES modules stay unobfuscated so their import/export semantics are not broken.
+- Encodes classic JavaScript inside a newly randomized execution wrapper on every response. Direct browser navigation to any `.js` or `.mjs` route also receives the encoded view; executable ES-module fetches retain their import/export grammar and URL base.
 - Conservatively compacts CSS while leaving the source files on disk untouched.
 - Detects common DevTools window-size changes, repeated object-getter probes, and inspection shortcuts; wipes the document on detection; clears the console every 100 ms; and optionally enables a bounded debugger trap.
 - Uses browser-compatible width/height thresholds so vertical-tab sidebars do not look like docked DevTools; Firefox/Zen also skip the two browser-specific probes that otherwise produce false positives there.
-- Blocks phone and tablet user agents, including iPadOS desktop-mode detection via touch capabilities; disable with `SITE_GUARD_BLOCK_MOBILE=0` if needed.
+- Allows phones and tablets by default. Set `SITE_GUARD_BLOCK_MOBILE=1` to block mobile/tablet user agents, including iPadOS desktop-mode detection via touch capabilities.
 - Watches its injected guard marker for DOM tampering and blocks printing while the guarded page is active.
 - Sends no-cache, no-index, anti-framing, object-blocking, same-origin resource, and optional HSTS headers.
 - Refuses oversized HTML, CSS, and JavaScript transformation requests; configure the limit with `SITE_GUARD_MAX_TEXT_BYTES`.

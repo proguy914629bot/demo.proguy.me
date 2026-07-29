@@ -38,7 +38,7 @@ PASSWORD_HASH = os.getenv("SITE_GUARD_PASSWORD_HASH", "")
 SESSION_TTL = int(os.getenv("SITE_GUARD_SESSION_TTL", "28800"))
 MAX_TEXT_BYTES = int(os.getenv("SITE_GUARD_MAX_TEXT_BYTES", str(5 * 1024 * 1024)))
 COOKIE_SECURE = os.getenv("SITE_GUARD_COOKIE_SECURE", "0").lower() in {"1", "true", "yes"}
-BLOCK_MOBILE_DEVICES = os.getenv("SITE_GUARD_BLOCK_MOBILE", "1").lower() in {"1", "true", "yes"}
+BLOCK_MOBILE_DEVICES = os.getenv("SITE_GUARD_BLOCK_MOBILE", "0").lower() in {"1", "true", "yes"}
 AGGRESSIVE_PROTECTION = os.getenv("SITE_GUARD_AGGRESSIVE", "0").lower() in {"1", "true", "yes"}
 DEVTOOLS_THRESHOLD = int(os.getenv("SITE_GUARD_DEVTOOLS_THRESHOLD", "170"))
 SECRET = os.getenv("SITE_GUARD_SECRET", "").encode() or secrets.token_bytes(32)
@@ -348,11 +348,12 @@ def _runtime_script(marker: str) -> str:
     # DevTools detection is deliberately a deterrent. It is never treated as an
     # authorization boundary; the server-side session remains the real boundary.
     aggressive = "true" if AGGRESSIVE_PROTECTION else "false"
+    block_mobile = "true" if BLOCK_MOBILE_DEVICES else "false"
     return f"""(()=>{{
-const mobileDevice=/Android|iPhone|iPad|iPod|Windows Phone|Mobile Safari|Opera Mini|IEMobile|Kindle|Silk\\/|webOS|BlackBerry/i.test(navigator.userAgent)||(/Macintosh|Mac OS X/i.test(navigator.userAgent)&&navigator.maxTouchPoints>1),firefoxLike=/Firefox|Zen/i.test(navigator.userAgent),threshold=Math.max({DEVTOOLS_THRESHOLD},170),widthThreshold=firefoxLike?Math.max(threshold,330):Math.max(threshold,320),aggressive={aggressive},marker='{marker}',safeLog=console.log.bind(console),safeClear=console.clear.bind(console);let blocked=false,getterHits=0,getterSignals=0;
+const mobileDevice=/Android|iPhone|iPad|iPod|Windows Phone|Mobile Safari|Opera Mini|IEMobile|Kindle|Silk\\/|webOS|BlackBerry/i.test(navigator.userAgent)||(/Macintosh|Mac OS X/i.test(navigator.userAgent)&&navigator.maxTouchPoints>1),blockMobile={block_mobile},firefoxLike=/Firefox|Zen/i.test(navigator.userAgent),threshold=Math.max({DEVTOOLS_THRESHOLD},170),widthThreshold=firefoxLike?Math.max(threshold,330):Math.max(threshold,320),aggressive={aggressive},marker='{marker}',safeLog=console.log.bind(console),safeClear=console.clear.bind(console);let blocked=false,getterHits=0,getterSignals=0;
 document.documentElement.style.visibility='hidden';
 const deny=()=>{{if(blocked)return;blocked=true;document.documentElement.style.visibility='visible';document.documentElement.innerHTML='<head><title>Inspection blocked</title></head><body style="margin:0;background:#09090b;color:#fafafa;font:16px system-ui;display:grid;place-items:center;min-height:100vh"><main style="text-align:center"><h1>Inspection blocked</h1><p>Close developer tools and reload this page.</p></main></body>';if(aggressive){{let n=0;const trap=setInterval(()=>{{debugger;if(++n>80)clearInterval(trap)}},125);}}}};
-if(mobileDevice)deny();
+if(blockMobile&&mobileDevice)deny();
 const dimensions=()=>{{const widthGap=window.outerWidth-window.innerWidth,heightGap=window.outerHeight-window.innerHeight,open=widthGap>widthThreshold||heightGap>threshold;if(open)deny();return open;}};
 const pauseStart=performance.now();if(!firefoxLike)debugger;const debuggerOpen=!firefoxLike&&performance.now()-pauseStart>100;if(debuggerOpen)deny();
 const probe=new Image();Object.defineProperty(probe,'id',{{configurable:false,get(){{getterHits++;return'guard';}}}});
@@ -375,11 +376,31 @@ def _inject_runtime(source: str) -> str:
     return script + source
 
 
-def _rewrite_tag_urls(raw_tag: str, site_prefix: str, site_name: str | None = None) -> str:
+def _rewrite_root_relative_url(url: str, site_prefix: str, site_name: str | None = None) -> str:
+    """Scope a root-relative URL to the guarded site's public route."""
     site_prefix = "/" + site_prefix.strip("/")
     site_name_prefix = "/" + site_prefix.rsplit("/", 1)[-1]
     mount_prefix = site_prefix[: -len(site_name_prefix)]
     legacy_prefix = f"/{site_name}.com" if site_name and "." not in site_name else ""
+
+    if not url.startswith("/") or url.startswith("//"):
+        return url
+    if url == site_prefix or url.startswith(tuple(site_prefix + suffix for suffix in ("/", "?", "#"))):
+        return url
+    # Preserve a site-prefixed URL written in the source while adding only
+    # the external mount prefix (for example /example.com/x ->
+    # /example/example.com/x).
+    if url == site_name_prefix or url.startswith(tuple(site_name_prefix + suffix for suffix in ("/", "?", "#"))):
+        return mount_prefix + url
+    if legacy_prefix and (
+        url == legacy_prefix or url.startswith(tuple(legacy_prefix + suffix for suffix in ("/", "?", "#")))
+    ):
+        return site_prefix + url[len(legacy_prefix):]
+    return site_prefix + url
+
+
+def _rewrite_tag_urls(raw_tag: str, site_prefix: str, site_name: str | None = None) -> str:
+    site_prefix = "/" + site_prefix.strip("/")
 
     def replace(match: re.Match[str]) -> str:
         url = match.group("quoted") if match.group("quote") else match.group("bare")
@@ -396,20 +417,9 @@ def _rewrite_tag_urls(raw_tag: str, site_prefix: str, site_name: str | None = No
                 quote_char = match.group("quote") or ""
                 return f"{match.group('prefix')}{quote_char}{rewritten}{quote_char}"
             return match.group(0)
-        if url.startswith("//"):
+        rewritten = _rewrite_root_relative_url(url, site_prefix, site_name)
+        if rewritten == url:
             return match.group(0)
-
-        if url == site_prefix or url.startswith(tuple(site_prefix + suffix for suffix in ("/", "?", "#"))):
-            return match.group(0)
-        # Preserve a site-prefixed URL written in the source while adding only
-        # the external mount prefix (for example /example.com/x ->
-        # /example/example.com/x).
-        if url == site_name_prefix or url.startswith(tuple(site_name_prefix + suffix for suffix in ("/", "?", "#"))):
-            rewritten = mount_prefix + url
-        elif legacy_prefix and (url == legacy_prefix or url.startswith(tuple(legacy_prefix + suffix for suffix in ("/", "?", "#")))):
-            rewritten = site_prefix + url[len(legacy_prefix):]
-        else:
-            rewritten = site_prefix + url
         quote_char = match.group("quote") or ""
         return f"{match.group('prefix')}{quote_char}{rewritten}{quote_char}"
 
@@ -478,11 +488,11 @@ def _protect_html(source: str, site: str, route_prefix: str | None = None) -> st
         "<title>Loading…</title><style>html{visibility:hidden}</style></head><body>"
         "<noscript>JavaScript is required.</noscript><script>"
         "const blockedMarkup='" + blocked_markup.replace("'", "\\'") + "';"
-        "const mobileDevice=/Android|iPhone|iPad|iPod|Windows Phone|Mobile Safari|Opera Mini|IEMobile|Kindle|Silk\\/|webOS|BlackBerry/i.test(navigator.userAgent)||(/Macintosh|Mac OS X/i.test(navigator.userAgent)&&navigator.maxTouchPoints>1);"
+        "const mobileDevice=/Android|iPhone|iPad|iPod|Windows Phone|Mobile Safari|Opera Mini|IEMobile|Kindle|Silk\\/|webOS|BlackBerry/i.test(navigator.userAgent)||(/Macintosh|Mac OS X/i.test(navigator.userAgent)&&navigator.maxTouchPoints>1);const blockMobile=" + ("true" if BLOCK_MOBILE_DEVICES else "false") + ";"
         "const firefoxLike=/Firefox|Zen/i.test(navigator.userAgent);const pauseStart=performance.now();if(!firefoxLike)debugger;const debuggerOpen=!firefoxLike&&performance.now()-pauseStart>100;"
         "const threshold=Math.max(" + str(DEVTOOLS_THRESHOLD) + ",170);const widthThreshold=firefoxLike?Math.max(threshold,330):Math.max(threshold,320);"
         "const devtoolsOpen=(window.outerWidth-window.innerWidth)>widthThreshold||(window.outerHeight-window.innerHeight)>threshold;"
-        "if(mobileDevice||devtoolsOpen||debuggerOpen){document.documentElement.style.visibility='visible';document.documentElement.innerHTML=blockedMarkup;}"
+        "if((blockMobile&&mobileDevice)||devtoolsOpen||debuggerOpen){document.documentElement.style.visibility='visible';document.documentElement.innerHTML=blockedMarkup;}"
         "else{const d=" + decoder + ";document.open();document.write(d);document.close();}"
         "</script></body></html>"
     )
@@ -520,14 +530,174 @@ def _compact_css(source: str) -> str:
     return "".join(output).strip()
 
 
-def _protect_javascript(source: str) -> str:
-    # Modules must retain their import/export grammar and URL base. Ordinary
-    # classic scripts can be delivered through an encoded indirect-eval wrapper.
-    if re.search(r"(^|\n)\s*(?:import\s|export\s)", source):
+def _rewrite_css_urls(source: str, site_prefix: str, site_name: str | None = None) -> str:
+    """Rewrite root-relative values in actual CSS url() functions."""
+    output: list[str] = []
+    index = 0
+    quote_char: str | None = None
+    while index < len(source):
+        char = source[index]
+        if quote_char:
+            output.append(char)
+            if char == "\\" and index + 1 < len(source):
+                index += 1
+                output.append(source[index])
+            elif char == quote_char:
+                quote_char = None
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote_char = char
+            output.append(char)
+            index += 1
+            continue
+        if source.startswith("/*", index):
+            end = source.find("*/", index + 2)
+            if end < 0:
+                output.append(source[index:])
+                break
+            output.append(source[index : end + 2])
+            index = end + 2
+            continue
+
+        is_url_function = (
+            source[index : index + 3].lower() == "url"
+            and index + 3 < len(source)
+            and source[index + 3] == "("
+            and (index == 0 or not (source[index - 1].isalnum() or source[index - 1] in "_-\\"))
+        )
+        if not is_url_function:
+            output.append(char)
+            index += 1
+            continue
+
+        closing = index + 4
+        inner_quote: str | None = None
+        while closing < len(source):
+            inner_char = source[closing]
+            if inner_char == "\\" and closing + 1 < len(source):
+                closing += 2
+                continue
+            if inner_quote:
+                if inner_char == inner_quote:
+                    inner_quote = None
+            elif inner_char in {"'", '"'}:
+                inner_quote = inner_char
+            elif inner_char == ")":
+                break
+            closing += 1
+        if closing >= len(source):
+            output.append(source[index:])
+            break
+
+        inner = source[index + 4 : closing]
+        leading_length = len(inner) - len(inner.lstrip())
+        trailing_length = len(inner) - len(inner.rstrip())
+        leading = inner[:leading_length]
+        trailing = inner[len(inner) - trailing_length :] if trailing_length else ""
+        value_end = len(inner) - trailing_length if trailing_length else len(inner)
+        value = inner[leading_length:value_end]
+
+        quote = value[0] if len(value) >= 2 and value[0] in {"'", '"'} and value[-1] == value[0] else ""
+        url = value[1:-1] if quote else value
+        rewritten = _rewrite_root_relative_url(url, site_prefix, site_name)
+        rewritten_value = f"{quote}{rewritten}{quote}" if quote else rewritten
+        output.append(source[index : index + 4] + leading + rewritten_value + trailing + ")")
+        index = closing + 1
+    return "".join(output)
+
+
+def _javascript_without_literals_and_comments(source: str) -> str:
+    """Mask JavaScript text that must not participate in module detection."""
+    output: list[str] = []
+    index = 0
+    state = "code"
+    quote_char = ""
+    while index < len(source):
+        char = source[index]
+        next_char = source[index + 1] if index + 1 < len(source) else ""
+        if state == "line-comment":
+            if char in "\r\n":
+                state = "code"
+                output.append(char)
+            else:
+                output.append(" ")
+        elif state == "block-comment":
+            if char == "*" and next_char == "/":
+                output.extend((" ", " "))
+                index += 1
+                state = "code"
+            else:
+                output.append(char if char in "\r\n" else " ")
+        elif state == "string":
+            if char == "\\" and next_char:
+                output.extend((" ", next_char if next_char in "\r\n" else " "))
+                index += 1
+            elif char == quote_char:
+                output.append(" ")
+                state = "code"
+            else:
+                output.append(char if char in "\r\n" else " ")
+        elif char == "/" and next_char == "/":
+            output.extend((" ", " "))
+            index += 1
+            state = "line-comment"
+        elif char == "/" and next_char == "*":
+            output.extend((" ", " "))
+            index += 1
+            state = "block-comment"
+        elif char in {"'", '"', "`"}:
+            output.append(" ")
+            quote_char = char
+            state = "string"
+        else:
+            output.append(char)
+        index += 1
+    return "".join(output)
+
+
+def _contains_javascript_module_syntax(source: str) -> bool:
+    code = _javascript_without_literals_and_comments(source)
+    static_statement = re.search(
+        r"(?:^|[;}\n])\s*(?:import(?!\s*\()|export\b)",
+        code,
+    )
+    return bool(static_statement or re.search(r"\bimport\s*\.\s*meta\b", code))
+
+
+def _protect_javascript(
+    source: str,
+    *,
+    module_hint: bool = False,
+    force_wrapper: bool = False,
+) -> str:
+    # An executable module response must retain its import/export grammar and
+    # URL base. A direct browser navigation is only a source view, so it can use
+    # the same randomized encoded wrapper as a classic script.
+    if (module_hint or _contains_javascript_module_syntax(source)) and not force_wrapper:
         return source
     payload, key = _xor_payload(source)
     decoder = _decoder_expression(payload, key)
     return f"(()=>{{const s={decoder};(0,eval)(s);}})();"
+
+
+def _javascript_source_view(request: Request) -> bool:
+    """Identify a browser navigating to JavaScript as a document."""
+    fetch_destination = request.headers.get("sec-fetch-dest", "").strip().lower()
+    if fetch_destination:
+        return fetch_destination == "document"
+    # Sec-Fetch-Dest is present in current browsers. The Accept fallback covers
+    # clients that omit Fetch Metadata while avoiding ordinary script requests.
+    return "text/html" in request.headers.get("accept", "").lower()
+
+
+def _javascript_module_fetch(request: Request) -> bool:
+    """Use Fetch Metadata to recognize an executable JavaScript module."""
+    return (
+        request.headers.get("sec-fetch-mode", "").strip().lower() == "cors"
+        and request.headers.get("sec-fetch-dest", "").strip().lower()
+        in {"script", "worker", "sharedworker", "serviceworker"}
+    )
 
 
 def _login_page(
@@ -765,12 +935,18 @@ async def guarded_site(request: Request, site: str, resource_path: str = "") -> 
         if resource.stat().st_size > MAX_TEXT_BYTES:
             return PlainTextResponse("CSS file is too large", status_code=413)
         source = resource.read_text(encoding="utf-8")
-        return Response(_compact_css(source), media_type="text/css", headers=_security_headers())
+        rewritten_source = _rewrite_css_urls(source, route_prefix, site)
+        return Response(_compact_css(rewritten_source), media_type="text/css", headers=_security_headers())
     if suffix in {".js", ".mjs"}:
         if resource.stat().st_size > MAX_TEXT_BYTES:
             return PlainTextResponse("JavaScript file is too large", status_code=413)
         source = resource.read_text(encoding="utf-8")
-        return Response(_protect_javascript(source), media_type="text/javascript", headers=_security_headers())
+        protected_source = _protect_javascript(
+            source,
+            module_hint=suffix == ".mjs" or _javascript_module_fetch(request),
+            force_wrapper=_javascript_source_view(request),
+        )
+        return Response(protected_source, media_type="text/javascript", headers=_security_headers())
 
     media_type = mimetypes.guess_type(resource.name)[0] or "application/octet-stream"
     return FileResponse(resource, media_type=media_type, headers=_security_headers())
