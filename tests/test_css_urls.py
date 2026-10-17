@@ -1,6 +1,6 @@
 import unittest
 
-from main import _rewrite_css_urls
+from main import _compact_css, _rewrite_css_urls
 
 
 class RewriteCssUrlsTests(unittest.TestCase):
@@ -44,6 +44,18 @@ class RewriteCssUrlsTests(unittest.TestCase):
         rewritten = _rewrite_css_urls(source, "/preview/client.test", "client.test")
 
         self.assertEqual(rewritten, ".a{src:url('/preview/client.test/assets/font.ttf')}")
+
+
+class CompactCssTests(unittest.TestCase):
+    def test_keeps_whitespace_required_by_calc(self) -> None:
+        self.assertEqual(_compact_css(".a { width: calc(100% + 2rem); }"), ".a{width:calc(100% + 2rem);}")
+        self.assertEqual(
+            _compact_css("h1 { font-size: clamp(1rem, 2vw + 1rem, 3rem) }"),
+            "h1{font-size:clamp(1rem,2vw + 1rem,3rem)}",
+        )
+
+    def test_keeps_descendant_combinator_before_pseudo_class(self) -> None:
+        self.assertEqual(_compact_css(".nav :is(a) { color: red }"), ".nav :is(a){color:red}")
 
 
 if __name__ == "__main__":

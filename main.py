@@ -51,11 +51,26 @@ except json.JSONDecodeError as exc:
     raise ValueError("SITE_GUARD_CREDENTIALS_JSON is not valid JSON") from exc
 
 SITE_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
-URL_ATTRIBUTE_RE = re.compile(
-    r"""(?P<prefix>(?<![\w:-])(?:href|src|action|poster)\s*=\s*)
-        (?:(?P<quote>["'])(?P<quoted>.*?)(?P=quote)|(?P<bare>[^\s"'=<>`]+))""",
-    flags=re.IGNORECASE | re.VERBOSE,
+
+
+def _attribute_re(names: str) -> re.Pattern[str]:
+    return re.compile(
+        r"""(?P<prefix>(?<![\w:-])(?:""" + names + r""")\s*=\s*)
+            (?:(?P<quote>["'])(?P<quoted>.*?)(?P=quote)|(?P<bare>[^\s"'=<>`]+))""",
+        flags=re.IGNORECASE | re.VERBOSE | re.DOTALL,
+    )
+
+
+URL_ATTRIBUTE_RE = _attribute_re("href|src|action|poster|formaction")
+SRCSET_ATTRIBUTE_RE = _attribute_re("srcset|imagesrcset")
+STYLE_ATTRIBUTE_RE = _attribute_re("style")
+CONTENT_ATTRIBUTE_RE = _attribute_re("content")
+META_REFRESH_URL_RE = re.compile(
+    r"""^(?P<head>\s*[\d.]*\s*[;,]\s*(?:url\s*=\s*)?)(?P<quote>['"]?)(?P<url>[^'"]*)(?P=quote)""",
+    flags=re.IGNORECASE,
 )
+DOCTYPE_RE = re.compile(r"\s*(<!doctype[^>]*>)", flags=re.IGNORECASE)
+VIEWPORT_META_RE = re.compile(r"<meta\s[^>]*name\s*=\s*[\"']?viewport\b[^>]*>", flags=re.IGNORECASE)
 BARE_DOMAIN_PATH_RE = re.compile(
     r"^[A-Za-z0-9](?:[A-Za-z0-9-]*\.)+[A-Za-z]{2,}(?::\d+)?(?:[/?#].*)?$"
 )
@@ -367,9 +382,50 @@ if(!blocked&&!dimensions()&&!debuggerOpen)document.documentElement.style.visibil
 }})();"""
 
 
-def _inject_runtime(source: str) -> str:
+def _link_scope_script(route_prefix: str) -> str:
+    # Links, forms, and popups created or changed by page JavaScript never pass
+    # through the server-side HTML rewrite, so scope them when they are used.
+    # Assignments to location cannot be intercepted; the context-cookie
+    # redirect in the server handles those.
+    return (
+        "(()=>{const prefix=" + json.dumps("/" + route_prefix.strip("/")) + ","
+        "siteName='/'+prefix.split('/').pop(),mount=prefix.slice(0,prefix.length-siteName.length),"
+        "within=(path,base)=>path===base||path.startsWith(base+'/');"
+        "const scope=value=>{if(value==null)return value;const raw=String(value).trim();"
+        "if(!raw||raw.startsWith('#')||(/^[a-z][a-z0-9+.-]*:/i.test(raw)&&!/^https?:/i.test(raw)))return value;"
+        "let url;try{const base=new URL(document.baseURI);"
+        # Resolve relative paths as if the site were hosted at "/", so "../"
+        # behaves as it would there instead of climbing out of the prefix.
+        "if(!/^(?:[a-z][a-z0-9+.-]*:|\\/)/i.test(raw)&&within(base.pathname,prefix)){"
+        "base.pathname=base.pathname.slice(prefix.length)||'/';url=new URL(raw,base);url.pathname=prefix+url.pathname}"
+        "else{url=new URL(raw,base);"
+        "if(url.origin!==location.origin||within(url.pathname,prefix)||url.pathname.startsWith('/__guard/'))return value;"
+        "url.pathname=within(url.pathname,siteName)?mount+url.pathname:prefix+url.pathname}"
+        "return url.href===new URL(raw,document.baseURI).href?value:url.href}catch(error){return value}};"
+        "const scopeAttribute=(element,name)=>{const value=element.getAttribute(name);"
+        "if(value===null)return;const scoped=scope(value);if(scoped!==value)element.setAttribute(name,scoped)};"
+        "const scopeLink=event=>{const link=event.target instanceof Element&&event.target.closest('a[href],area[href]');"
+        "if(link)scopeAttribute(link,'href')};"
+        "document.addEventListener('click',scopeLink,true);document.addEventListener('auxclick',scopeLink,true);"
+        "document.addEventListener('submit',event=>{const submitter=event.submitter;"
+        "if(submitter&&submitter.hasAttribute('formaction'))scopeAttribute(submitter,'formaction');"
+        "else if(event.target instanceof HTMLFormElement)scopeAttribute(event.target,'action')},true);"
+        "const nativeSubmit=HTMLFormElement.prototype.submit;"
+        "HTMLFormElement.prototype.submit=function(){scopeAttribute(this,'action');return nativeSubmit.call(this)};"
+        "const nativeOpen=window.open;"
+        "window.open=function(url,...rest){return nativeOpen.call(window,scope(url),...rest)};"
+        "})();"
+    )
+
+
+def _inject_runtime(source: str, route_prefix: str) -> str:
     marker = secrets.token_hex(16)
-    script = f'<meta data-site-guard="{marker}"><script>' + _runtime_script(marker) + "</script>"
+    script = (
+        f'<meta data-site-guard="{marker}"><script>'
+        + _runtime_script(marker)
+        + _link_scope_script(route_prefix)
+        + "</script>"
+    )
     head = re.search(r"<head(?:\s[^>]*)?>", source, flags=re.IGNORECASE)
     if head:
         return source[: head.end()] + script + source[head.end() :]
@@ -399,11 +455,22 @@ def _rewrite_root_relative_url(url: str, site_prefix: str, site_name: str | None
     return site_prefix + url
 
 
+def _rewrite_attribute_values(raw_tag: str, pattern: re.Pattern[str], transform) -> str:
+    def replace(match: re.Match[str]) -> str:
+        value = match.group("quoted") if match.group("quote") else match.group("bare")
+        rewritten = transform(value)
+        if rewritten == value:
+            return match.group(0)
+        quote_char = match.group("quote") or ""
+        return f"{match.group('prefix')}{quote_char}{rewritten}{quote_char}"
+
+    return pattern.sub(replace, raw_tag)
+
+
 def _rewrite_tag_urls(raw_tag: str, site_prefix: str, site_name: str | None = None) -> str:
     site_prefix = "/" + site_prefix.strip("/")
 
-    def replace(match: re.Match[str]) -> str:
-        url = match.group("quoted") if match.group("quote") else match.group("bare")
+    def rewrite_url(url: str) -> str:
         if not url.startswith("/"):
             if BARE_DOMAIN_PATH_RE.fullmatch(url):
                 route_site = site_prefix.rsplit("/", 1)[-1]
@@ -411,19 +478,38 @@ def _rewrite_tag_urls(raw_tag: str, site_prefix: str, site_name: str | None = No
                 # name, append only its remaining path. Otherwise retain the
                 # complete domain-shaped path beneath this guard route.
                 if url == route_site or url.startswith(route_site + "/"):
-                    rewritten = site_prefix + url[len(route_site):]
-                else:
-                    rewritten = site_prefix + "/" + url
-                quote_char = match.group("quote") or ""
-                return f"{match.group('prefix')}{quote_char}{rewritten}{quote_char}"
-            return match.group(0)
-        rewritten = _rewrite_root_relative_url(url, site_prefix, site_name)
-        if rewritten == url:
-            return match.group(0)
-        quote_char = match.group("quote") or ""
-        return f"{match.group('prefix')}{quote_char}{rewritten}{quote_char}"
+                    return site_prefix + url[len(route_site):]
+                return site_prefix + "/" + url
+            return url
+        return _rewrite_root_relative_url(url, site_prefix, site_name)
 
-    return URL_ATTRIBUTE_RE.sub(replace, raw_tag)
+    def rewrite_srcset(srcset: str) -> str:
+        candidates = []
+        for candidate in srcset.split(","):
+            stripped = candidate.lstrip()
+            url, separator, descriptor = stripped.partition(" ")
+            rewritten = _rewrite_root_relative_url(url, site_prefix, site_name)
+            candidates.append(candidate[: len(candidate) - len(stripped)] + rewritten + separator + descriptor)
+        return ",".join(candidates)
+
+    raw_tag = _rewrite_attribute_values(raw_tag, URL_ATTRIBUTE_RE, rewrite_url)
+    raw_tag = _rewrite_attribute_values(raw_tag, SRCSET_ATTRIBUTE_RE, rewrite_srcset)
+    raw_tag = _rewrite_attribute_values(
+        raw_tag, STYLE_ATTRIBUTE_RE, lambda style: _rewrite_css_urls(style, site_prefix, site_name)
+    )
+    return raw_tag
+
+
+def _rewrite_meta_refresh(raw_tag: str, site_prefix: str, site_name: str | None = None) -> str:
+    def rewrite_content(content: str) -> str:
+        match = META_REFRESH_URL_RE.match(content)
+        if not match:
+            return content
+        rewritten = _rewrite_root_relative_url(match.group("url").strip(), site_prefix, site_name)
+        quote_char = match.group("quote")
+        return match.group("head") + quote_char + rewritten + quote_char + content[match.end():]
+
+    return _rewrite_attribute_values(raw_tag, CONTENT_ATTRIBUTE_RE, rewrite_content)
 
 
 class _SiteUrlRewriter(HTMLParser):
@@ -434,18 +520,35 @@ class _SiteUrlRewriter(HTMLParser):
         self.site_prefix = site_prefix
         self.site_name = site_name
         self.output: list[str] = []
+        self.style_data: list[str] | None = None
+
+    def _rewrite_start_tag(self, tag: str, attrs: list[tuple[str, str | None]]) -> str:
+        raw_tag = _rewrite_tag_urls(self.get_starttag_text(), self.site_prefix, self.site_name)
+        if tag == "meta" and any(
+            name == "http-equiv" and (value or "").strip().lower() == "refresh" for name, value in attrs
+        ):
+            raw_tag = _rewrite_meta_refresh(raw_tag, self.site_prefix, self.site_name)
+        return raw_tag
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        self.output.append(_rewrite_tag_urls(self.get_starttag_text(), self.site_prefix, self.site_name))
+        self.output.append(self._rewrite_start_tag(tag, attrs))
+        if tag == "style":
+            self.style_data = []
 
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        self.output.append(_rewrite_tag_urls(self.get_starttag_text(), self.site_prefix, self.site_name))
+        self.output.append(self._rewrite_start_tag(tag, attrs))
 
     def handle_endtag(self, tag: str) -> None:
+        if tag == "style" and self.style_data is not None:
+            self.output.append(_rewrite_css_urls("".join(self.style_data), self.site_prefix, self.site_name))
+            self.style_data = None
         self.output.append(f"</{tag}>")
 
     def handle_data(self, data: str) -> None:
-        self.output.append(data)
+        if self.style_data is not None:
+            self.style_data.append(data)
+        else:
+            self.output.append(data)
 
     def handle_entityref(self, name: str) -> None:
         self.output.append(f"&{name};")
@@ -470,12 +573,15 @@ def _rewrite_site_urls(source: str, site_prefix: str, site_name: str | None = No
     rewriter = _SiteUrlRewriter(site_prefix, site_name)
     rewriter.feed(source)
     rewriter.close()
+    if rewriter.style_data is not None:
+        rewriter.output.extend(rewriter.style_data)
     return "".join(rewriter.output)
 
 
 def _protect_html(source: str, site: str, route_prefix: str | None = None) -> str:
-    rewritten_source = _rewrite_site_urls(source, route_prefix or f"/{site}", site)
-    payload, key = _xor_payload(_inject_runtime(rewritten_source))
+    route_prefix = route_prefix or f"/{site}"
+    rewritten_source = _rewrite_site_urls(source, route_prefix, site)
+    payload, key = _xor_payload(_inject_runtime(rewritten_source, route_prefix))
     decoder = _decoder_expression(payload, key)
     blocked_markup = (
         "<head><title>Inspection blocked</title></head><body style=\"margin:0;background:#09090b;"
@@ -483,9 +589,16 @@ def _protect_html(source: str, site: str, route_prefix: str | None = None) -> st
         "<main style=\"text-align:center\"><h1>Inspection blocked</h1>"
         "<p>Close developer tools and reload this page.</p></main></body>"
     )
+    # The loader document is replaced via document.write, so it must render in
+    # the same compatibility mode and with the same viewport as the real page;
+    # otherwise layout differs from hosting the file directly.
+    doctype = DOCTYPE_RE.match(source.lstrip("﻿"))
+    viewport = VIEWPORT_META_RE.search(source)
     return (
-        "<!doctype html><html><head><meta charset=utf-8><meta name=robots content=noindex,nofollow>"
-        "<title>Loading…</title><style>html{visibility:hidden}</style></head><body>"
+        (doctype.group(1) if doctype else "")
+        + "<html><head><meta charset=utf-8><meta name=robots content=noindex,nofollow>"
+        + (viewport.group(0) if viewport else "")
+        + "<title>Loading…</title><style>html{visibility:hidden}</style></head><body>"
         "<noscript>JavaScript is required.</noscript><script>"
         "const blockedMarkup='" + blocked_markup.replace("'", "\\'") + "';"
         "const mobileDevice=/Android|iPhone|iPad|iPod|Windows Phone|Mobile Safari|Opera Mini|IEMobile|Kindle|Silk\\/|webOS|BlackBerry/i.test(navigator.userAgent)||(/Macintosh|Mac OS X/i.test(navigator.userAgent)&&navigator.maxTouchPoints>1);const blockMobile=" + ("true" if BLOCK_MOBILE_DEVICES else "false") + ";"
@@ -500,7 +613,9 @@ def _protect_html(source: str, site: str, route_prefix: str | None = None) -> st
 
 def _compact_css(source: str) -> str:
     # Conservative compaction: strings remain untouched, while comments and
-    # whitespace outside strings are reduced.
+    # whitespace outside strings are reduced. Whitespace around "+" is kept
+    # because calc()/clamp() require it, and whitespace before ":" is kept
+    # because it is a descendant combinator in selectors such as ".a :hover".
     output: list[str] = []
     index = 0
     quote_char: str | None = None
@@ -520,10 +635,10 @@ def _compact_css(source: str) -> str:
             end = source.find("*/", index + 2)
             index = len(source) if end < 0 else end + 1
         elif char.isspace():
-            if output and output[-1] not in "{}:;,>+~ " and index + 1 < len(source):
+            if output and output[-1] not in "{}:;,>~ " and index + 1 < len(source):
                 output.append(" ")
         else:
-            if char in "{}:;,>+~" and output and output[-1] == " ":
+            if char in "{};,>~" and output and output[-1] == " ":
                 output.pop()
             output.append(char)
         index += 1
@@ -765,8 +880,30 @@ class AttemptLimiter:
 attempt_limiter = AttemptLimiter()
 
 
-@app.get("/", response_class=PlainTextResponse)
-async def root() -> PlainTextResponse:
+def _context_redirect(request: Request) -> Response | None:
+    """Send an unscoped request (for example ``/`` or ``/about``) made by a
+    guarded page back beneath that page's route prefix."""
+    legacy_context = _valid_context_token(request.cookies.get("site_guard_context"))
+    if not legacy_context:
+        return None
+    _, route_prefix = legacy_context
+    requested_path = request.url.path.lstrip("/")
+    if requested_path.startswith("__guard/"):
+        return None
+    target = f"{route_prefix}/{requested_path}"
+    if request.url.query:
+        target += "?" + request.url.query
+    return RedirectResponse(target, status_code=307)
+
+
+@app.get("/")
+async def root(request: Request) -> Response:
+    # A typed URL or bookmark (Sec-Fetch-Site: none) shows the landing text;
+    # a link or script redirect from a guarded page returns to that site.
+    if request.headers.get("sec-fetch-site", "").lower() != "none":
+        redirect = _context_redirect(request)
+        if redirect is not None:
+            return redirect
     return PlainTextResponse("Site guard is running. Open /<site-name>/ to continue.")
 
 
@@ -886,13 +1023,7 @@ def _site_route_context(site_segment: str, resource_path: str) -> tuple[str, str
 async def guarded_site(request: Request, site: str, resource_path: str = "") -> Response:
     context = _site_route_context(site, resource_path)
     if context is None:
-        legacy_context = _valid_context_token(request.cookies.get("site_guard_context"))
-        if legacy_context:
-            _, route_prefix = legacy_context
-            requested_asset = request.url.path.lstrip("/")
-            if requested_asset and not requested_asset.startswith("__guard/"):
-                return RedirectResponse(f"{route_prefix}/{requested_asset}", status_code=307)
-        return PlainTextResponse("Site not found", status_code=404)
+        return _context_redirect(request) or PlainTextResponse("Site not found", status_code=404)
     site, resource_path, site_dir, route_prefix = context
     if _mobile_device_request(request):
         return _mobile_blocked_page()
